@@ -73,8 +73,37 @@ export class StateStore {
 	}
 
 	async save(value: WorktreeState): Promise<void> {
-		const content = JSON.stringify(value, null, 2) + "\n";
-		const filename = this.filename(value.path, "json");
+		await this.write(
+			this.filename(value.path, "json"),
+			JSON.stringify(value, null, 2) + "\n",
+		);
+	}
+
+	/** The worktree most recently focused in any window, opened when switching to this repository. */
+	async lastUsed(): Promise<string | undefined> {
+		try {
+			const value = JSON.parse(
+				await fs.readFile(this.lastUsedFilename, "utf8"),
+			);
+			return typeof value?.path === "string" ? value.path : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	async setLastUsed(worktreePath: string): Promise<void> {
+		if ((await this.lastUsed()) === worktreePath) return;
+		await this.write(
+			this.lastUsedFilename,
+			JSON.stringify({ path: worktreePath }) + "\n",
+		);
+	}
+
+	private get lastUsedFilename(): string {
+		return path.join(this.directory, "last-used.json");
+	}
+
+	private async write(filename: string, content: string): Promise<void> {
 		const previous = this.writes.get(filename) ?? Promise.resolve();
 		const writing = previous
 			.catch(() => {})

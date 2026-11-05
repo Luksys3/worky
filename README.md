@@ -8,6 +8,7 @@ Manage Git worktrees and GitHub pull requests in VS Code. Works locally and over
 - Open a worktree in the current VS Code window or a new window.
 - Copy a worktree or main checkout to a new branch, preserving staged, unstaged, and untracked changes.
 - Jump to a worktree or PR by pasting its ticket ID, branch, PR number, or title.
+- Switch to another repository from the Repositories list. Worky opens the worktree you last used there, or its main checkout.
 - See your current pull request and PRs awaiting your review; open them on GitHub or in a worktree.
 - Automatically run your `worky.json` setup commands for new worktrees, each in its own terminal, and its teardown commands before deleting one.
 - Open an existing T3 conversation or start a new one for a worktree.
@@ -28,6 +29,7 @@ Available on macOS and Linux.
 | Shortcut     | Action                                                          |
 | ------------ | --------------------------------------------------------------- |
 | Ctrl+Shift+W | Go to a worktree or PR by branch, PR number, or title           |
+| Ctrl+Shift+Q | Switch to another repository                                    |
 | Ctrl+Shift+T | Open current worktree's T3 chat                                 |
 | Ctrl+Shift+C | Save selected code for a later T3 message                       |
 | Ctrl+Shift+V | Send all saved citations (from an editor or the Citations list) |

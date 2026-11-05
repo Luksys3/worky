@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { matchesPullRequest } from "./git";
 import { compareWorktrees, PullRequest, Worktree } from "./model";
+import type { Repository } from "./repositories";
 
 export function ageLabel(date?: Date): string {
 	if (!date || !Number.isFinite(date.getTime())) return "age unknown";
@@ -325,6 +326,109 @@ export class PullRequestsView implements vscode.TreeDataProvider<
 		);
 		if (!rows.length) rows.push(new InfoItem("No open pull requests"));
 		return rows;
+	}
+	refresh(): void {
+		this.emitter.fire();
+	}
+	dispose(): void {
+		this.emitter.dispose();
+	}
+}
+
+export function repositoryDescription(
+	repository: Repository,
+	current: boolean,
+): string {
+	const target = repository.target;
+	return [
+		current ? "Current" : undefined,
+		repository.error
+			? "Unavailable"
+			: target &&
+				(target.branch ?? `detached ${target.head.slice(0, 8)}`),
+		repository.location,
+	]
+		.filter(Boolean)
+		.join(" · ");
+}
+
+export class RepositoryItem extends vscode.TreeItem {
+	constructor(
+		readonly repository: Repository,
+		currentPath?: string,
+		activity?: string,
+	) {
+		super(repository.name);
+		this.id = repository.path;
+		const current = repository.path === currentPath;
+		this.description = [
+			activity,
+			repositoryDescription(repository, current),
+		]
+			.filter(Boolean)
+			.join(" · ");
+		this.contextValue = activity
+			? "repository-busy"
+			: [
+					"repository",
+					repository.target && !repository.target.main
+						? "worktree"
+						: "",
+				]
+					.filter(Boolean)
+					.join("-");
+		this.iconPath = new vscode.ThemeIcon(
+			activity ? "loading~spin" : current ? "check" : "repo",
+			repository.error
+				? new vscode.ThemeColor("errorForeground")
+				: undefined,
+		);
+		if (!activity)
+			this.command = {
+				command: "worky.openRepository",
+				title: "Open Repository",
+				arguments: [this],
+			};
+		this.tooltip = [
+			repository.path,
+			repository.error ??
+				(repository.target &&
+					`Opens ${repository.target.main ? "the main checkout" : `last used worktree ${repository.target.path}`}`),
+		]
+			.filter(Boolean)
+			.join("\n\n");
+	}
+}
+
+export class RepositoriesView implements vscode.TreeDataProvider<
+	RepositoryItem | InfoItem
+> {
+	private readonly emitter = new vscode.EventEmitter<void>();
+	readonly onDidChangeTreeData = this.emitter.event;
+	items?: Repository[];
+	readonly activity = new Map<string, string>();
+	currentPath?: string;
+	getTreeItem(item: RepositoryItem | InfoItem): vscode.TreeItem {
+		return item;
+	}
+	getChildren(): (RepositoryItem | InfoItem)[] {
+		if (!this.items) return [new LoadingItem("Loading repositories…")];
+		if (!this.items.length)
+			return [
+				new InfoItem(
+					"No Git repositories found",
+					"worky.settings",
+					"Change worky.repositoryDirectories or worky.hiddenRepositories.",
+				),
+			];
+		return this.items.map(
+			(item) =>
+				new RepositoryItem(
+					item,
+					this.currentPath,
+					this.activity.get(item.path),
+				),
+		);
 	}
 	refresh(): void {
 		this.emitter.fire();

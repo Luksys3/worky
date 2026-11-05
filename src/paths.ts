@@ -1,5 +1,14 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
+
+export function expandHome(value: string): string {
+	return value === "~"
+		? os.homedir()
+		: value.startsWith("~/")
+			? path.join(os.homedir(), value.slice(2))
+			: path.resolve(value);
+}
 
 // Resolve symlink parents even for an unsaved/deleted file or a new destination.
 export async function canonicalPath(filename: string): Promise<string> {

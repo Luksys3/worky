@@ -12,6 +12,7 @@ import { testCurrentPullRequest } from "./current-pull-request-integration";
 import { CitationStore } from "../src/citation-store";
 import { testCitations } from "./citations-integration";
 import { testDuplicate } from "./duplicate-integration";
+import { testRepositories } from "./repositories-integration";
 
 async function waitFor(
 	check: () => Promise<boolean>,
@@ -64,6 +65,7 @@ export async function run(): Promise<void> {
 			vscode.extensions.getExtension<Worky>("Luksys3.worky");
 		assert.ok(extension, "extension is installed in the development host");
 		const worky = await extension.activate();
+		await worky.ready;
 		const commands = await vscode.commands.getCommands(true);
 		for (const name of [
 			"worky.duplicate",
@@ -292,6 +294,7 @@ export async function run(): Promise<void> {
 			await testWorkspaceActions(worky);
 			await testCurrentPullRequest(worky);
 			await testDuplicate(worky);
+			await testRepositories(worky, f.root, f.repository, f.worktree);
 			await testCitations(worky);
 			await new CitationStore(state, f.worktree).add(
 				{

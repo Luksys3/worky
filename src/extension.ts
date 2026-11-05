@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { git, matchesPullRequest, parseWorktrees, Worktrees } from "./git";
 import { readConfig } from "./config";
-import { canonicalPath, isWithinDirectory } from "./paths";
+import { canonicalPath, expandHome, isWithinDirectory } from "./paths";
 import { GitHubClient } from "./github";
 import { message, PullRequest, Worktree } from "./model";
 import { SetupManager, TerminalTasks } from "./setup";
@@ -14,30 +14,37 @@ import { Citations, CitationDestination, CitationRow } from "./citations";
 import { Notifications } from "./notifications";
 import { CitationStore } from "./citation-store";
 import { GoToItem, goToItems } from "./go-to";
+import { listRepositories, Repository, repositoryTarget } from "./repositories";
 import {
 	pullRequestKey,
 	PullRequestItem,
 	PullRequestsView,
+	RepositoriesView,
+	repositoryDescription,
+	RepositoryItem,
 	WorktreeItem,
 	WorktreesView,
 } from "./views";
 
-function expandHome(value: string): string {
-	return value === "~"
-		? os.homedir()
-		: value.startsWith("~/")
-			? path.join(os.homedir(), value.slice(2))
-			: path.resolve(value);
+interface RepositoryPickItem extends vscode.QuickPickItem {
+	repository: Repository;
 }
 
 export class Worky implements vscode.Disposable {
 	readonly worktreeView = new WorktreesView();
 	readonly pullRequestView = new PullRequestsView(this.worktreeView.activity);
+	readonly repositoryView = new RepositoriesView();
+	/** The first refresh, started on activation. */
+	ready: Promise<void> = Promise.resolve();
 	repository?: Worktrees;
 	private setup?: SetupManager;
 	private configKey?: string;
 	private refreshing?: Promise<void>;
 	private refreshingPulls?: Promise<void>;
+	private refreshingRepositories?: Promise<void>;
+	private readonly repositoryTree: vscode.TreeView<
+		RepositoryItem | vscode.TreeItem
+	>;
 	private pullRequestAbort?: AbortController;
 	private pullRequestsEnabled = false;
 	private lastPullRefresh = 0;
@@ -60,15 +67,22 @@ export class Worky implements vscode.Disposable {
 		const pulls = vscode.window.createTreeView("worky.pullRequests", {
 			treeDataProvider: this.pullRequestView,
 		});
+		const repositories = (this.repositoryTree =
+			vscode.window.createTreeView("worky.repositories", {
+				treeDataProvider: this.repositoryView,
+			}));
 		this.trees.push(
 			worktrees,
 			pulls as vscode.TreeView<WorktreeItem | vscode.TreeItem>,
+			repositories as vscode.TreeView<WorktreeItem | vscode.TreeItem>,
 		);
 		this.disposables.push(
 			worktrees,
 			pulls,
+			repositories,
 			this.worktreeView,
 			this.pullRequestView,
+			this.repositoryView,
 			this.log,
 			this.notifications,
 		);
@@ -175,6 +189,22 @@ export class Worky implements vscode.Disposable {
 				return this.openPullRequest(item.pullRequest, false);
 		});
 		command("goTo", () => this.goTo());
+		command("switchRepository", () => this.switchRepository());
+		command("openRepository", (item: RepositoryItem) =>
+			this.openRepository(item.repository),
+		);
+		command("openRepositoryNewWindow", (item: RepositoryItem) =>
+			this.openRepository(item.repository, true),
+		);
+		command("openRepositoryCurrentWindow", (item: RepositoryItem) =>
+			this.openRepository(item.repository, false),
+		);
+		command("openRepositoryMain", (item: RepositoryItem) =>
+			this.openRepository(item.repository, this.openInNewWindow, true),
+		);
+		command("hideRepository", (item: RepositoryItem) =>
+			this.hideRepository(item.repository),
+		);
 		command("openPullRequestOnGitHub", (item: PullRequestItem) => {
 			if (this.pullRequestsEnabled)
 				return this.openPullRequestOnGitHub(item.pullRequest);
@@ -204,8 +234,10 @@ export class Worky implements vscode.Disposable {
 					);
 			}),
 			vscode.window.onDidChangeWindowState((event) => {
-				if (event.focused)
-					void this.refresh().catch((error) => this.report(error));
+				if (!event.focused) return;
+				// Record before the refresh: its worktree status scan can outlast a short visit.
+				this.recordLastUsed();
+				void this.refresh().catch((error) => this.report(error));
 			}),
 			vscode.authentication.onDidChangeSessions((event) => {
 				if (event.provider.id === "github") {
@@ -219,6 +251,12 @@ export class Worky implements vscode.Disposable {
 			pulls.onDidChangeVisibility((event) => {
 				if (event.visible)
 					void this.refreshPullRequests().catch((error) =>
+						this.report(error),
+					);
+			}),
+			repositories.onDidChangeVisibility((event) => {
+				if (event.visible)
+					void this.refreshRepositories().catch((error) =>
 						this.report(error),
 					);
 			}),
@@ -260,7 +298,50 @@ export class Worky implements vscode.Disposable {
 
 	async refresh(forcePulls = false): Promise<void> {
 		await this.refreshWorktrees(forcePulls);
-		await this.refreshPullRequests(forcePulls);
+		await Promise.all([
+			this.refreshPullRequests(forcePulls),
+			this.refreshRepositories(forcePulls),
+		]);
+	}
+
+	/** Lists repositories only while their view is shown, unless `evenIfHidden` (the picker). */
+	async refreshRepositories(
+		afterChange = false,
+		evenIfHidden = false,
+	): Promise<void> {
+		if (!evenIfHidden && !this.repositoryTree.visible) return;
+		if (this.refreshingRepositories) {
+			await this.refreshingRepositories;
+			if (!afterChange) return;
+			// The listing in flight may predate the settings change.
+			return this.refreshRepositories(false, evenIfHidden);
+		}
+		this.refreshingRepositories = Promise.resolve(
+			vscode.window.withProgress(
+				{ location: { viewId: "worky.repositories" } },
+				() => this.loadRepositories(),
+			),
+		).finally(() => {
+			this.refreshingRepositories = undefined;
+		});
+		return this.refreshingRepositories;
+	}
+
+	private async loadRepositories(): Promise<void> {
+		const config = vscode.workspace.getConfiguration("worky");
+		try {
+			this.repositoryView.items = await listRepositories(
+				config.get<string[]>("repositoryDirectories", ["~"]),
+				config.get<string[]>("hiddenRepositories", []),
+			);
+			this.repositoryView.currentPath = this.repository
+				? await canonicalPath(this.repository.mainPath)
+				: undefined;
+		} catch (error) {
+			this.repositoryView.items ??= [];
+			this.log.appendLine(`Repositories: ${message(error)}`);
+		}
+		this.repositoryView.refresh();
 	}
 
 	async refreshWorktrees(afterMutation = false): Promise<void> {
@@ -354,6 +435,7 @@ export class Worky implements vscode.Disposable {
 			this.worktreeView.error = undefined;
 			this.worktreeView.currentPath = await this.currentPath();
 			this.pullRequestView.worktrees = this.worktreeView.items;
+			if (vscode.window.state.focused) this.recordLastUsed();
 			const folder = this.currentFolder();
 			if (folder && this.worktreeView.currentPath) {
 				// Run only persisted, unfinished setup initiated by Worky. External worktrees have no marker.
@@ -374,6 +456,25 @@ export class Worky implements vscode.Disposable {
 		this.pullRequestView.refresh();
 		this.updateCurrentWorktreeContext();
 		await this.citations.refresh();
+	}
+
+	/** The last focused worktree is where switching to this repository goes. */
+	private recordLastUsed(): void {
+		const repository = this.repository;
+		void this.currentPath()
+			.then((current) => {
+				if (
+					repository &&
+					current &&
+					this.worktreeView.items.some(
+						(item) => item.path === current,
+					)
+				)
+					return repository.state.setLastUsed(current);
+			})
+			.catch((error) =>
+				this.log.appendLine(`Last used worktree: ${message(error)}`),
+			);
 	}
 
 	private currentFolder(): vscode.WorkspaceFolder | undefined {
@@ -813,7 +914,8 @@ export class Worky implements vscode.Disposable {
 	}
 
 	private goTo(): void {
-		this.requireRepository();
+		// Open at once while the repository is still loading; only a known failure stops it.
+		if (this.worktreeView.error) this.requireRepository();
 		const picker = vscode.window.createQuickPick<GoToItem>();
 		picker.title = "Go to Worktree or Pull Request";
 		picker.placeholder = "Search by branch, PR number, or title";
@@ -837,11 +939,28 @@ export class Worky implements vscode.Disposable {
 			label: "$(add) Create New Worktree…",
 			alwaysShow: true,
 		};
+		const loadingWorktrees: GoToItem = {
+			label: "$(loading~spin) Loading worktrees…",
+			alwaysShow: true,
+		};
+		const loadingPullRequests: GoToItem = {
+			label: "$(loading~spin) Loading pull requests…",
+			alwaysShow: true,
+		};
 		let open = true;
 		let searching = false;
+		let loading = true;
+		let showsLoading = false;
 		const update = () => {
 			if (!open) return;
 			searching = Boolean(picker.value);
+			const worktreesPending =
+				!this.repository && !this.worktreeView.error;
+			const pullRequestsPending =
+				loading &&
+				this.pullRequestsEnabled &&
+				!this.pullRequestView.items.length;
+			showsLoading = worktreesPending || pullRequestsPending;
 			const { worktrees, pullRequests } = goToItems(
 				this.worktreeView.items,
 				this.pullRequestsEnabled ? this.pullRequestView.items : [],
@@ -853,23 +972,30 @@ export class Worky implements vscode.Disposable {
 					? [windowButton, gitHubButton]
 					: [windowButton],
 			});
+			// Creating needs the repository, so offer it once loaded.
+			const create = worktreesPending ? [] : [createItem];
 			picker.items = [
-				...(searching ? [] : [createItem]),
+				...(searching ? [] : create),
 				{
 					label: "Worktrees",
 					kind: vscode.QuickPickItemKind.Separator,
 				},
-				...worktrees.map(withButtons),
-				...(pullRequests.length
+				...(worktreesPending
+					? [loadingWorktrees]
+					: worktrees.map(withButtons)),
+				...(pullRequests.length || pullRequestsPending
 					? [
 							{
 								label: "Pull Requests",
 								kind: vscode.QuickPickItemKind.Separator,
 							},
 							...pullRequests.map(withButtons),
+							...(pullRequestsPending
+								? [loadingPullRequests]
+								: []),
 						]
 					: []),
-				...(searching
+				...(searching && create.length
 					? [
 							{
 								label: "",
@@ -881,6 +1007,8 @@ export class Worky implements vscode.Disposable {
 			];
 		};
 		const go = (item: GoToItem, window = newWindow) => {
+			if (item === loadingWorktrees || item === loadingPullRequests)
+				return;
 			picker.hide();
 			const action =
 				item === createItem
@@ -903,8 +1031,19 @@ export class Worky implements vscode.Disposable {
 		picker.onDidChangeValue(() => {
 			if (Boolean(picker.value) !== searching) update();
 		});
+		// Fill loading rows as soon as each part arrives; afterwards keep the
+		// list stable so later refreshes don't move the selection.
+		const listeners = [
+			this.worktreeView.onDidChangeTreeData(() => {
+				if (showsLoading) update();
+			}),
+			this.pullRequestView.onDidChangeTreeData(() => {
+				if (showsLoading) update();
+			}),
+		];
 		picker.onDidHide(() => {
 			open = false;
+			listeners.forEach((listener) => listener.dispose());
 			picker.dispose();
 		});
 		update();
@@ -915,6 +1054,127 @@ export class Worky implements vscode.Disposable {
 			.catch((error) => this.log.appendLine(message(error)))
 			.finally(() => {
 				if (!open) return;
+				loading = false;
+				picker.busy = false;
+				if (this.worktreeView.error) {
+					picker.hide();
+					this.report(new Error(this.worktreeView.error));
+				} else update();
+			});
+	}
+
+	private async openRepository(
+		repository: Repository,
+		newWindow = this.openInNewWindow,
+		main = false,
+	): Promise<void> {
+		if (this.repositoryView.activity.has(repository.path)) return;
+		this.repositoryView.activity.set(repository.path, "Opening…");
+		this.repositoryView.refresh();
+		try {
+			// Resolve again: another window may have used a different worktree since the listing.
+			await this.openFolder(
+				await repositoryTarget(repository.path, main),
+				newWindow,
+			);
+		} finally {
+			this.repositoryView.activity.delete(repository.path);
+			this.repositoryView.refresh();
+		}
+	}
+
+	private async hideRepository(repository: Repository): Promise<void> {
+		const config = vscode.workspace.getConfiguration("worky");
+		// A name hides every repository called that; use the path when names collide.
+		const ambiguous = this.repositoryView.items?.some(
+			(item) =>
+				item.path !== repository.path && item.name === repository.name,
+		);
+		await config.update(
+			"hiddenRepositories",
+			[
+				...config.get<string[]>("hiddenRepositories", []),
+				ambiguous ? repository.path : repository.name,
+			],
+			vscode.ConfigurationTarget.Global,
+		);
+	}
+
+	private switchRepository(): void {
+		const picker = vscode.window.createQuickPick<RepositoryPickItem>();
+		picker.title = "Switch Repository";
+		picker.placeholder = "Search repositories";
+		picker.matchOnDescription = true;
+		const newWindow = this.openInNewWindow;
+		const windowButton: vscode.QuickInputButton = {
+			iconPath: new vscode.ThemeIcon(
+				newWindow ? "go-to-file" : "empty-window",
+			),
+			tooltip: newWindow
+				? "Open in Current Window"
+				: "Open in New Window",
+		};
+		const mainButton: vscode.QuickInputButton = {
+			iconPath: new vscode.ThemeIcon("repo"),
+			tooltip: "Open Main Checkout",
+		};
+		const loadingItem = {
+			label: "$(loading~spin) Loading repositories…",
+			alwaysShow: true,
+		} as RepositoryPickItem;
+		let open = true;
+		let loading = true;
+		const update = () => {
+			if (!open) return;
+			const items = this.repositoryView.items ?? [];
+			if (loading && !items.length) {
+				picker.items = [loadingItem];
+				return;
+			}
+			picker.items = items.map((repository) => {
+				const current =
+					repository.path === this.repositoryView.currentPath;
+				return {
+					label: `$(${current ? "check" : "repo"}) ${repository.name}`,
+					description: repositoryDescription(repository, current),
+					repository,
+					buttons:
+						repository.target && !repository.target.main
+							? [windowButton, mainButton]
+							: [windowButton],
+				};
+			});
+		};
+		const go = (
+			repository: Repository,
+			window = newWindow,
+			main = false,
+		) => {
+			picker.hide();
+			void this.openRepository(repository, window, main).catch((error) =>
+				this.report(error),
+			);
+		};
+		picker.onDidAccept(() => {
+			const item = picker.selectedItems[0];
+			if (item && item !== loadingItem) go(item.repository);
+		});
+		picker.onDidTriggerItemButton(({ item, button }) => {
+			if (button === windowButton) go(item.repository, !newWindow);
+			else go(item.repository, newWindow, true);
+		});
+		picker.onDidHide(() => {
+			open = false;
+			picker.dispose();
+		});
+		update();
+		picker.show();
+		picker.busy = true;
+		void this.refreshRepositories(false, true)
+			.catch((error) => this.log.appendLine(message(error)))
+			.finally(() => {
+				if (!open) return;
+				loading = false;
 				picker.busy = false;
 				update();
 			});
@@ -1076,6 +1336,11 @@ export async function activate(
 ): Promise<Worky> {
 	const worky = new Worky();
 	context.subscriptions.push(worky);
-	await worky.refresh();
+	// Don't await: VS Code holds Worky's commands until activation finishes, and the
+	// first refresh includes GitHub. Pickers show loading rows meanwhile.
+	worky.ready = worky.refresh();
+	worky.ready.catch((error) =>
+		vscode.window.showErrorMessage(`Worky: ${message(error)}`),
+	);
 	return worky;
 }
